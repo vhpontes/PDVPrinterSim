@@ -1,4 +1,5 @@
-// main.cpp
+// Descrição: PDVPrinterSim com captura local de texto ESC/POS, PDF e XPS.
+// Derivado de PDVPrinterSim, copyright (c) 2025 Victor Hugo Manata Pontes; licença MIT em LICENSE.
 #include <SFML/Graphics.hpp>
 #include <iostream>
 #include <string>
@@ -6,9 +7,16 @@
 #include <thread>
 #include <queue>
 #include <mutex>
+#include <memory>
+#include <filesystem>
+#include <sstream>
+#include <algorithm>
+#include <utility>
+#include "enquadramento.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include "pdf_support.hpp"
 #pragma comment(lib, "ws2_32.lib")
 
 #define DEFAULT_PORT "9100"
@@ -95,169 +103,26 @@ void sendDataToServer(const std::string& data) {
     closesocket(clientSocket);
 }
 
-void run_server() {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "[SERVIDOR] WSAStartup falhou." << std::endl;
-        return;
+#include "network.hpp"
+
+
+
+int main(int argc, char** argv) {
+    wchar_t exePath[32768]{};
+    DWORD chars = GetModuleFileNameW(nullptr, exePath, 32768);
+    if (chars == 0 || chars >= 32768) return 1;
+    std::filesystem::current_path(std::filesystem::path(exePath).parent_path());
+    if (argc > 1 && std::string(argv[1]) == "--headless") {
+        g_headless = true; run_server(); return g_listening ? 0 : 1;
     }
-    std::cout << "[SERVIDOR] Winsock inicializado." << std::endl;
-
-    struct addrinfo *result = NULL, hints;
-    ZeroMemory(&hints, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    hints.ai_flags = AI_PASSIVE;
-
-    getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
-    SOCKET listenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-    bind(listenSocket, result->ai_addr, (int)result->ai_addrlen);
-    freeaddrinfo(result);
-
-    std::cout << "[SERVIDOR] Aguardando conexoes na porta " << DEFAULT_PORT << "..." << std::endl;
-    while (true) {
-        if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
-            std::cerr << "[SERVIDOR] Listen falhou." << std::endl;
-            closesocket(listenSocket);
-            WSACleanup();
-            return;
-        }
-
-        SOCKET clientSocket = accept(listenSocket, NULL, NULL);
-        if (clientSocket == INVALID_SOCKET) {
-            std::cerr << "[SERVIDOR] Accept falhou." << std::endl;
-            continue;
-        }
-        std::cout << "[SERVIDOR] Cliente conectado!" << std::endl;
-
-        // --- LINHAS CORRIGIDAS ---
-        char recvbuf[DEFAULT_BUFLEN];
-        int bytesReceived;
-
-        PrinterState currentState; // Estado da impressora para esta conexão
-        std::string currentTextLine; // Acumulador de texto para a linha atual
-
-        do {
-            bytesReceived = recv(clientSocket, recvbuf, DEFAULT_BUFLEN, 0);
-            if (bytesReceived > 0) {
-                // Itera por cada byte recebido
-                for (int i = 0; i < bytesReceived; ++i) {
-                    unsigned char byte = recvbuf[i];
-
-                    switch (byte) {
-                        case 0x1B: // Comando ESC
-                        {
-                            if (i + 1 < bytesReceived) {
-                                i++; 
-                                unsigned char commandByte = recvbuf[i];
-                                
-                                if (commandByte == '@') { // ESC @ - Inicializar Impressora
-                                    currentState = PrinterState(); // Reseta TUDO para o estado padrão
-                                } 
-                                else if (commandByte == 'a') { // ESC a - Justificação
-                                    if (i + 1 < bytesReceived) {
-                                        i++;
-                                        unsigned char param = recvbuf[i];
-                                        if (param == 0 || param == 48) currentState.justification = PrinterState::LEFT;
-                                        else if (param == 1 || param == 49) currentState.justification = PrinterState::CENTER;
-                                        else if (param == 2 || param == 50) currentState.justification = PrinterState::RIGHT;
-                                    }
-                                }
-                                else if (commandByte == 'E') { // ESC E - Negrito
-                                    if (i + 1 < bytesReceived) {
-                                        i++;
-                                        currentState.isBold = (recvbuf[i] == 1);
-                                    }
-                                }
-                                else if (commandByte == '-') { // ESC - - Sublinhado
-                                    if (i + 1 < bytesReceived) {
-                                        i++;
-                                        currentState.isUnderlined = (recvbuf[i] == 1);
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        case 0x1D: // Comando GS
-                        {
-                            if (i + 1 < bytesReceived) {
-                                i++;
-                                unsigned char commandByte = recvbuf[i];
-                                if (commandByte == '!') { // GS ! - Tamanho do caractere
-                                    if (i + 1 < bytesReceived) {
-                                        i++;
-                                        unsigned char param = recvbuf[i];
-                                        currentState.widthMultiplier = ((param >> 0) & 0x0F) + 1;
-                                        currentState.heightMultiplier = ((param >> 4) & 0x0F) + 1;
-                                    }
-                                }
-                                // --- NOVO COMANDO ADICIONADO AQUI ---
-                                else if (commandByte == 'V') { // GS V - Cortar Papel
-                                    // Parâmetro (m) não é necessário para a simulação, então o ignoramos.
-                                    // Apenas enviamos uma linha especial para a fila.
-                                    PrintLine cutLine;
-                                    cutLine.text = "--[CUT]--"; // Um "código secreto" para a parte gráfica
-                                    cutLine.state = currentState; // O estado não importa, mas precisa ser enviado
-                                    
-                                    std::lock_guard<std::mutex> lock(g_queueMutex);
-                                    g_printQueue.push(cutLine);
-                                }
-                                // ---------------------------------------
-                            }
-                            break;
-                        }
-                       case 0x0A: // Comando LF (Nova Linha) - LÓGICA ATUALIZADA
-                        {
-                            PrintLine line;
-                            line.state = currentState;
-
-                            // Verifica se a linha tem o delimitador de coluna '|'
-                            size_t delimiterPos = currentTextLine.find('|');
-                            if (delimiterPos != std::string::npos) {
-                                line.leftText = currentTextLine.substr(0, delimiterPos);
-                                line.rightText = currentTextLine.substr(delimiterPos + 1);
-                            } else {
-                                line.leftText = currentTextLine;
-                                line.rightText = ""; // Sem texto à direita
-                            }
-
-                            std::lock_guard<std::mutex> lock(g_queueMutex);
-                            g_printQueue.push(line);
-                            
-                            currentTextLine.clear();
-                            break;
-                        }
-                        default:
-                        {
-                            // Caractere normal, adiciona ao texto da linha
-                            if (byte != '\r') { // Ignora Carriage Return
-                                currentTextLine += byte;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        } while (bytesReceived > 0);
-
-
-        std::cout << "[SERVIDOR] Cliente desconectado." << std::endl;
-        shutdown(clientSocket, SD_SEND);
-        closesocket(clientSocket);
-    }
-    closesocket(listenSocket);
-    WSACleanup();
-}
-
-
-int main() {
     std::thread serverThread(run_server);
     serverThread.detach();
 
     // --- CONFIGURAÇÃO GRÁFICA ---
     sf::Font font;
-    if (!font.loadFromFile("assets/consola.ttf")) {
+    wchar_t windowsDirectory[MAX_PATH]{};
+    if (!GetWindowsDirectoryW(windowsDirectory, MAX_PATH) ||
+        !font.loadFromFile((std::filesystem::path(windowsDirectory) / "Fonts" / "consola.ttf").string())) {
         std::cerr << "[GRAFICOS] Erro: Nao foi possivel carregar a fonte." << std::endl;
         return -1;
     }
@@ -278,12 +143,12 @@ int main() {
 
     printerSprite.setScale(fatorEscalaX, fatorEscalaY);
 
-    sf::RenderWindow window(sf::VideoMode(larguraDesejada, alturaDesejada + 80), "PDVPrinterSim - Emulador de Impressora Termica");
+    sf::RenderWindow window(sf::VideoMode(larguraDesejada, alturaDesejada + 100), "PDVPrinterSim - PDF / XPS / ESC-POS");
     window.setFramerateLimit(60);
 
     //sf::RectangleShape paper(sf::Vector2f(300, 210));
     sf::RectangleShape paper(sf::Vector2f(384, 315));
-    paper.setFillColor(sf::Color::Yellow);
+    paper.setFillColor(sf::Color::White);
     paper.setPosition(140, 79);
 
     std::vector<std::pair<sf::Text, sf::Text>> lines;
@@ -295,7 +160,7 @@ int main() {
     // --- BOTÃO DE TESTE ---
     sf::RectangleShape testButton(sf::Vector2f(200, 40));
     testButton.setFillColor(sf::Color(100, 100, 100));
-    testButton.setPosition((window.getSize().x - testButton.getSize().x) / 2.0f, 535);
+    testButton.setPosition((window.getSize().x - testButton.getSize().x) / 2.0f, 560);
 
     sf::Text buttonText;
     buttonText.setFont(font);
@@ -314,6 +179,19 @@ int main() {
     const float printHeadY = paper.getPosition().y + paper.getSize().y - 60; 
     
     bool receiptHasBeenCut = false;
+    std::shared_ptr<std::vector<PdfPageView>> pdfPages;
+    sf::Texture pdfTexture;
+    sf::RenderTexture paperCanvas;
+    if (!paperCanvas.create(384,315)) return 1;
+    size_t pageIndex = 0;
+    float pdfScroll = 0.f, targetWidth = 0.f;
+    int cropLeft = -1;
+    sf::Text status("Aguardando impressao local", font, 12);
+    status.setFillColor(sf::Color::White); status.setPosition(12, 500);
+    sf::Text aviso("Porta RAW local: 127.0.0.1:9100", font, 12);
+    aviso.setFillColor(sf::Color(255,205,135)); aviso.setPosition(12, 518);
+    sf::Text help("Mouse=rolar  setas=paginas  0=original  5/8=recorte virtual", font, 11);
+    help.setFillColor(sf::Color::White); help.setPosition(12, 538);
     
     // --- LOOP PRINCIPAL DA APLICAÇÃO ---
     while (window.isOpen()) {
@@ -323,6 +201,21 @@ int main() {
             if (event.type == sf::Event::Closed)
                 window.close();
 
+            if (event.type == sf::Event::MouseWheelScrolled && pdfPages) {
+                pdfScroll = std::max(0.f, pdfScroll - event.mouseWheelScroll.delta * 65.f);
+            }
+            if (event.type == sf::Event::KeyPressed && pdfPages) {
+                auto key = event.key.code;
+                if (key == sf::Keyboard::Num5 || key == sf::Keyboard::Numpad5) { targetWidth = 58.f; pdfScroll = 0; cropLeft = -1; }
+                if (key == sf::Keyboard::Num8 || key == sf::Keyboard::Numpad8) { targetWidth = 80.f; pdfScroll = 0; cropLeft = -1; }
+                if (key == sf::Keyboard::Num0 || key == sf::Keyboard::Numpad0) { targetWidth = 0.f; pdfScroll = 0; cropLeft = -1; }
+                if (targetWidth > 0 && (key == sf::Keyboard::A || key == sf::Keyboard::D)) {
+                    int passo = std::max(1, static_cast<int>(pdfTexture.getSize().x / 25));
+                    cropLeft = std::max(0, cropLeft + (key == sf::Keyboard::A ? -passo : passo));
+                }
+                if (key == sf::Keyboard::Right && pageIndex + 1 < pdfPages->size()) { ++pageIndex; pdfTexture.loadFromImage((*pdfPages)[pageIndex].image); pdfScroll = 0; cropLeft = -1; }
+                if (key == sf::Keyboard::Left && pageIndex > 0) { --pageIndex; pdfTexture.loadFromImage((*pdfPages)[pageIndex].image); pdfScroll = 0; cropLeft = -1; }
+            }
             if (event.type == sf::Event::MouseButtonPressed) {
                 if (event.mouseButton.button == sf::Mouse::Left) {
                     sf::Vector2f mousePos = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -352,7 +245,15 @@ int main() {
             }
         }
 
-        if (hasData) {
+        if (hasData && lineData.text == "--[PDF]--") {
+            std::lock_guard<std::mutex> lock(g_queueMutex);
+            if (!g_pdfQueue.empty()) {
+                pdfPages = g_pdfQueue.front(); g_pdfQueue.pop(); pageIndex = 0; pdfScroll = 0; targetWidth = 0; cropLeft = -1;
+                pdfTexture.loadFromImage((*pdfPages)[0].image); lines.clear(); receiptHasBeenCut = false;
+            }
+        } else if (hasData && lineData.text == "--[NEW]--") {
+            pdfPages.reset(); lines.clear(); receiptHasBeenCut = false;
+        } else if (hasData) {
             if (receiptHasBeenCut) {
                 lines.clear();
                 receiptHasBeenCut = false;
@@ -446,11 +347,41 @@ int main() {
         window.clear(sf::Color(50, 50, 50));
         window.draw(printerSprite);
         window.draw(paper);
-        for (const auto& linePair : lines) {
-            // Desenha as duas partes de cada linha
-            if(linePair.first.getGlobalBounds().intersects(paper.getGlobalBounds())) window.draw(linePair.first);
-            if(linePair.second.getGlobalBounds().intersects(paper.getGlobalBounds())) window.draw(linePair.second);
+        if (pdfPages && !pdfPages->empty()) {
+            const auto& page = (*pdfPages)[pageIndex];
+            unsigned iw = pdfTexture.getSize().x, ih = pdfTexture.getSize().y;
+            float shownMm = targetWidth > 0 ? std::min(targetWidth, page.widthMm) : page.widthMm;
+            int crop = std::max(1, std::min(static_cast<int>(iw), static_cast<int>(std::round(iw * shownMm / page.widthMm))));
+            float scale = 384.f / crop;
+            if (cropLeft < 0) {
+                auto conteudo = inicioConteudo(page.image);
+                cropLeft = conteudo.first - crop / 2;
+                pdfScroll = std::max(0.f, conteudo.second * scale - 10.f);
+            }
+            cropLeft = std::clamp(cropLeft, 0, static_cast<int>(iw) - crop);
+            pdfScroll = std::min(pdfScroll, std::max(0.f, ih * scale - 315.f));
+            sf::Sprite image(pdfTexture, sf::IntRect(cropLeft, 0, crop, static_cast<int>(ih)));
+            image.setScale(scale, scale); image.setPosition(0, -pdfScroll);
+            paperCanvas.clear(sf::Color::White); paperCanvas.draw(image); paperCanvas.display();
+            sf::Sprite canvas(paperCanvas.getTexture()); canvas.setPosition(paper.getPosition()); window.draw(canvas);
+            std::ostringstream label; label << page.format << " real: " << static_cast<int>(std::round(page.widthMm)) << " x "
+                << static_cast<int>(std::round(page.heightMm)) << " mm | pagina " << (pageIndex + 1) << "/" << pdfPages->size();
+            if (targetWidth > 0 && targetWidth < page.widthMm) label << " | corte virtual " << static_cast<int>(targetWidth) << " mm";
+            status.setString(label.str());
+            std::ostringstream diag;
+            if (page.vazio) diag << "PAGINA EM BRANCO - " << static_cast<int>(page.heightMm) << " mm de papel";
+            else diag << "Papel apos o conteudo: " << static_cast<int>(std::round(page.sobraInferiorMm)) << " mm (arquivo original)";
+            aviso.setString(diag.str());
+        } else {
+            for (const auto& linePair : lines) {
+                if(linePair.first.getGlobalBounds().intersects(paper.getGlobalBounds())) window.draw(linePair.first);
+                if(linePair.second.getGlobalBounds().intersects(paper.getGlobalBounds())) window.draw(linePair.second);
+            }
+            status.setString(g_listening ? "Aguardando trabalho de impressao em 127.0.0.1:9100" : "Iniciando servidor local...");
+            aviso.setString("Porta RAW local: 127.0.0.1:9100");
         }
+        { std::lock_guard<std::mutex> lock(g_queueMutex); if (!g_serverError.empty()) status.setString(g_serverError); }
+        window.draw(status); window.draw(aviso); window.draw(help);
         window.draw(testButton);
         window.draw(buttonText);
         window.display();

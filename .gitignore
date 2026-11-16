@@ -1,0 +1,12 @@
+# Descrição: exclui binários, dependências e capturas locais do pacote público.
+/build/
+/deps/
+/capturas/
+__pycache__/
+*.obj
+*.pdb
+*.exe
+*.dll
+*.log
+.vs/
+.venv/
